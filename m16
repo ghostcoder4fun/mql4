@@ -1,0 +1,403 @@
+//+------------------------------------------------------------------+
+//|  XAUUSD_HF_Scalper_Updated.mq4                                   |
+//|  High-frequency 1-tick scalper with consecutive trend filter + confidence |
+//|  Converted and enhanced by ChatGPT                                |
+//+------------------------------------------------------------------+
+#property copyright "Converted by ChatGPT"
+#property link      ""
+#property version   "1.13"
+#property strict
+
+//--- INPUTS
+input string TradeSymbol            = "XAUUSD";
+input double TRADE_AMOUNT_USD       = 10.0;
+input int    LEVERAGE               = 100;
+input bool   AUTO_LEVERAGE          = true;
+input double MIN_NOTIONAL_USD       = 10.0;
+input int    SEQ_LEN                = 20;
+input int    FUTURE_STEP_FOR_LABEL  = 1;
+input int    TRADE_HOLD_STEPS       = 1;
+input double SLIPPAGE_POINTS        = 3;
+input double MIN_INTERVAL_BETWEEN_ORDERS = 0.2;
+input int    MAX_ORDERS_PER_MINUTE  = 80;
+input double LotsMin                = 0.01;
+input double LotsStep               = 0.01;
+input int    PrintEveryTicks        = 1;
+input int    MIN_CONSECUTIVE_SIGNS  = 2;
+input double MIN_CONFIDENCE          = 0.7;  // Minimum confidence threshold to enter trade (0-1)
+input int    CONF_WINDOW             = 5;    // Rolling window for confidence calculation
+
+//--- internal globals
+double midBuffer[];
+double emaBuffer[];
+double deltaBuffer[];
+int    bufIndex = 0;
+int    bufCount = 0;
+
+datetime orderTimestamps[200];
+int      tsCount = 0;
+
+struct OpenTrade {
+  int    ticket;
+  double entryPrice;
+  string side;
+  int    openedOnTick;
+  double lots;
+  double notional;
+};
+OpenTrade openTrades[];
+
+string futurePreds[];
+double futureConfidences[];
+int tickIndex = 0;
+
+int wins=0, losses=0;
+double balance_at_start = 0.0;
+
+double lastOrderTime = 0.0;
+
+int accuracyBufferLen = 50;
+int accuracyBuffer[];
+int accIdx = 0, accCount = 0;
+
+double tickThreshold = 0.001;   // Minimum price delta to trigger a trade (adjusted for 1-tick)
+double emaAlpha = 0.3;          // EMA smoothing factor
+
+//+------------------------------------------------------------------+
+//| OnInit                                                           |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   ArrayResize(midBuffer, SEQ_LEN);
+   ArrayInitialize(midBuffer, 0.0);
+
+   ArrayResize(emaBuffer, SEQ_LEN);
+   ArrayInitialize(emaBuffer, 0.0);
+
+   ArrayResize(deltaBuffer, SEQ_LEN);
+   ArrayInitialize(deltaBuffer, 0.0);
+
+   ArrayResize(orderTimestamps, MAX_ORDERS_PER_MINUTE + 5);
+   ArrayInitialize(orderTimestamps, 0);
+
+   ArrayResize(futurePreds, FUTURE_STEP_FOR_LABEL);
+   ArrayResize(futureConfidences, FUTURE_STEP_FOR_LABEL);
+   for(int i=0; i<FUTURE_STEP_FOR_LABEL; i++) {
+      futurePreds[i] = "";
+      futureConfidences[i] = 0.0;
+   }
+
+   ArrayResize(accuracyBuffer, accuracyBufferLen);
+   ArrayInitialize(accuracyBuffer, 0);
+
+   balance_at_start = AccountBalance();
+
+   PrintFormat("[INIT] EA initialized for %s,M1 | TRADE_AMOUNT_USD=%.2f | LEVERAGE=%d | AUTO_LEVERAGE=%s | MIN_CONFIDENCE=%.2f",
+               TradeSymbol, TRADE_AMOUNT_USD, LEVERAGE, AUTO_LEVERAGE ? "true":"false", MIN_CONFIDENCE);
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Rate limiter                                                     |
+//+------------------------------------------------------------------+
+bool RateLimiterWaitSlot()
+{
+   double now_sec = (double)TimeCurrent();
+
+   if(now_sec - lastOrderTime < MIN_INTERVAL_BETWEEN_ORDERS)
+   {
+      Print("[RATE_LIMIT] Not enough time since last order");
+      return(false);
+   }
+
+   int keep=0;
+   for(int i=0; i<tsCount; i++){
+      if((double)orderTimestamps[i] >= (TimeCurrent() - 60))
+         orderTimestamps[keep++] = orderTimestamps[i];
+   }
+   tsCount = keep;
+
+   if(tsCount >= MAX_ORDERS_PER_MINUTE)
+   {
+      Print("[RATE_LIMIT] Too many orders in the last minute");
+      return(false);
+   }
+
+   orderTimestamps[tsCount++] = TimeCurrent();
+   lastOrderTime = now_sec;
+   return(true);
+}
+
+//+------------------------------------------------------------------+
+//| AUTO-LEVERAGE helper                                             |
+//+------------------------------------------------------------------+
+double GetMinLeverage(double tradeAmountUSD, double entryPrice)
+{
+   double contractSize = MarketInfo(TradeSymbol, MODE_LOTSIZE);
+   if(contractSize <= 0) contractSize = 100.0;
+
+   double size_ounces = tradeAmountUSD / entryPrice;
+   double lots_needed = size_ounces / contractSize;
+
+   if(lots_needed < LotsMin)
+   {
+      double minLeverage = (LotsMin * contractSize * entryPrice) / tradeAmountUSD;
+      PrintFormat("[AUTO_LEVERAGE] Minimum leverage required=%.0f for TRADE_AMOUNT=%.2f, entryPrice=%.5f",
+                  minLeverage, tradeAmountUSD, entryPrice);
+      return(minLeverage);
+   }
+   return(LEVERAGE);
+}
+
+//+------------------------------------------------------------------+
+//| Compute lots                                                     |
+//+------------------------------------------------------------------+
+double ComputeLots(double entryPrice)
+{
+   double contractSize = MarketInfo(TradeSymbol, MODE_LOTSIZE);
+   if(contractSize <= 0) contractSize = 100.0;
+
+   double effectiveLeverage = LEVERAGE;
+   if(AUTO_LEVERAGE) effectiveLeverage = GetMinLeverage(TRADE_AMOUNT_USD, entryPrice);
+
+   double size_ounces = (TRADE_AMOUNT_USD * effectiveLeverage) / entryPrice;
+   double lots = size_ounces / contractSize;
+
+   if(lots < LotsMin)
+   {
+      PrintFormat("[COMPUTE_LOTS] Computed lots too small: %.5f with leverage %.0f", lots, effectiveLeverage);
+      return(0.0);
+   }
+
+   int steps = (int)MathFloor(lots / LotsStep);
+   double normLots = steps * LotsStep;
+   if(normLots < LotsMin)
+   {
+      PrintFormat("[COMPUTE_LOTS] Normalized lots too small: %.5f", normLots);
+      return(0.0);
+   }
+
+   normLots = NormalizeDouble(normLots, 2);
+   PrintFormat("[COMPUTE_LOTS] Computed lots=%.2f with leverage=%.0f for price=%.5f", normLots, effectiveLeverage, entryPrice);
+   return(normLots);
+}
+
+//+------------------------------------------------------------------+
+//| Place market order                                               |
+//+------------------------------------------------------------------+
+int PlaceMarketOrder(string side, double price, double lots, bool isExit=false)
+{
+   if(!RateLimiterWaitSlot())
+   {
+      Print("[PLACE_ORDER] Rate limiter blocked the order");
+      return(-1);
+   }
+
+   int slippage = (int)SLIPPAGE_POINTS;
+   int ticket = -1;
+
+   if(side == "UP")
+   {
+      double ask = MarketInfo(TradeSymbol, MODE_ASK);
+      ticket = OrderSend(TradeSymbol, OP_BUY, lots, ask, slippage, 0, 0, "HF_EA", 0, 0, clrGreen);
+   }
+   else
+   {
+      double bid = MarketInfo(TradeSymbol, MODE_BID);
+      ticket = OrderSend(TradeSymbol, OP_SELL, lots, bid, slippage, 0, 0, "HF_EA", 0, 0, clrRed);
+   }
+
+   if(ticket < 0)
+      PrintFormat("[ERROR] OrderSend failed: %d - %s", GetLastError(), ErrorDescription(GetLastError()));
+   else
+      PrintFormat("[ORDER_PLACED] %s ticket=%d lots=%.2f price=%.5f", side, ticket, lots, price);
+
+   return(ticket);
+}
+
+//+------------------------------------------------------------------+
+//| Manage open trades based on future prediction                     |
+//+------------------------------------------------------------------+
+void ManageOpenTrades()
+{
+   if(ArraySize(openTrades) == 0) return;
+
+   string nextPred = futurePreds[FUTURE_STEP_FOR_LABEL-1]; // lookahead prediction
+
+   for(int i=ArraySize(openTrades)-1; i>=0; i--)
+   {
+      OpenTrade t = openTrades[i];
+      bool shouldExit = false;
+
+      // exit *before* adverse movement
+      if(t.side == "UP" && nextPred == "DOWN") shouldExit = true;
+      if(t.side == "DOWN" && nextPred == "UP") shouldExit = true;
+
+      if(shouldExit)
+      {
+         double closePrice = (t.side == "UP") ? MarketInfo(TradeSymbol, MODE_BID)
+                                             : MarketInfo(TradeSymbol, MODE_ASK);
+
+         if(OrderSelect(t.ticket, SELECT_BY_TICKET))
+         {
+            int res = OrderClose(t.ticket, t.lots, closePrice, (int)SLIPPAGE_POINTS, clrYellow);
+            if(res)
+            {
+               PrintFormat("💸 EXIT %s | ticket=%d @ %.5f lots=%.2f Bal=%.2f",
+                           t.side, t.ticket, closePrice, t.lots, AccountBalance());
+            }
+            else
+            {
+               PrintFormat("[ERROR] OrderClose failed: %d - %s", GetLastError(), ErrorDescription(GetLastError()));
+            }
+         }
+
+         for(int j=i; j<ArraySize(openTrades)-1; j++) openTrades[j] = openTrades[j+1];
+         ArrayResize(openTrades, ArraySize(openTrades)-1);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| EMA helper                                                        |
+//+------------------------------------------------------------------+
+double UpdateEMA(double price)
+{
+   double prevEMA = (bufCount == 1) ? price : emaBuffer[(bufIndex - 1 + SEQ_LEN) % SEQ_LEN];
+   double newEMA = emaAlpha * price + (1.0 - emaAlpha) * prevEMA;
+   emaBuffer[bufIndex] = newEMA;
+
+   // store delta for rolling confidence
+   double delta = newEMA - prevEMA;
+   deltaBuffer[bufIndex] = delta;
+
+   return(newEMA);
+}
+
+//+------------------------------------------------------------------+
+//| Prediction logic with rolling confidence                         |
+//+------------------------------------------------------------------+
+string MakePrediction(double &confidence)
+{
+   confidence = 0.0;
+   if(bufCount < SEQ_LEN) return("");
+
+   double lastDelta = deltaBuffer[(bufIndex - 1 + SEQ_LEN) % SEQ_LEN];
+   if(MathAbs(lastDelta) < 0.000001) lastDelta = 0.000001; // avoid zero
+
+   int countDir = 0;
+   int window = MathMin(CONF_WINDOW, bufCount);
+
+   for(int i=0; i<window; i++)
+   {
+      int idx = (bufIndex - 1 - i + SEQ_LEN) % SEQ_LEN;
+      if(lastDelta > 0 && deltaBuffer[idx] > 0) countDir++;
+      if(lastDelta < 0 && deltaBuffer[idx] < 0) countDir++;
+   }
+
+   confidence = (double)countDir / window;
+
+   string pred = "";
+   if(lastDelta > tickThreshold) pred = "UP";
+   else if(lastDelta < -tickThreshold) pred = "DOWN";
+
+   PrintFormat("[DEBUG] lastDelta=%.6f confidence=%.2f pred=%s", lastDelta, confidence, pred);
+
+   return pred;
+}
+
+//+------------------------------------------------------------------+
+//| OnTick                                                            |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   static int debugCounter = 0;
+
+   if(Symbol() != TradeSymbol)
+      return;
+
+   tickIndex++;
+
+   //---- CLOSE trades if prediction indicates reversal
+   ManageOpenTrades();
+
+   double bid = MarketInfo(TradeSymbol, MODE_BID);
+   double ask = MarketInfo(TradeSymbol, MODE_ASK);
+   if(bid <= 0 || ask <= 0) return;
+
+   double mid = (bid + ask) / 2.0;
+
+   midBuffer[bufIndex] = mid;
+   bufIndex = (bufIndex + 1) % SEQ_LEN;
+   if(bufCount < SEQ_LEN) bufCount++;
+
+   string pred = "";
+   double conf = 0.0;
+
+   if(bufCount == SEQ_LEN)
+   {
+      pred = MakePrediction(conf);
+      for(int i=0;i<FUTURE_STEP_FOR_LABEL-1;i++)
+      {
+         futurePreds[i]=futurePreds[i+1];
+         futureConfidences[i]=futureConfidences[i+1];
+      }
+      futurePreds[FUTURE_STEP_FOR_LABEL-1] = pred;
+      futureConfidences[FUTURE_STEP_FOR_LABEL-1] = conf;
+
+      if(debugCounter % PrintEveryTicks == 0)
+         PrintFormat("[%s] MADE_1TICK_PRED tick=%d Pred=%s conf=%.2f mid=%.5f",
+                     TimeToString(TimeCurrent(), TIME_SECONDS), tickIndex, pred, conf, mid);
+   }
+
+   //--- ENTRY
+   if(conf >= MIN_CONFIDENCE && ArraySize(openTrades)==0 && pred!="")
+   {
+      string tradeSide = pred;
+      double entryPrice = mid;
+      double notional = TRADE_AMOUNT_USD * LEVERAGE;
+
+      if(notional >= MIN_NOTIONAL_USD)
+      {
+         double lots = ComputeLots(entryPrice);
+         if(lots > 0.0)
+         {
+            int ticket = PlaceMarketOrder(tradeSide, entryPrice, lots, false);
+            if(ticket > 0)
+            {
+               OpenTrade t;
+               t.ticket = ticket;
+               t.entryPrice = entryPrice;
+               t.side = tradeSide;
+               t.openedOnTick = tickIndex;
+               t.lots = lots;
+               t.notional = notional;
+               ArrayResize(openTrades, ArraySize(openTrades) + 1);
+               openTrades[ArraySize(openTrades)-1] = t;
+
+               PrintFormat("💰 ENTER %s | $%.2f margin | notional=$%.2f @ %.5f lots=%.2f Bal=%.2f | conf=%.2f",
+                           tradeSide, TRADE_AMOUNT_USD, notional, entryPrice, lots, AccountBalance(), conf);
+            }
+         }
+      }
+   }
+
+   debugCounter++;
+}
+
+//+------------------------------------------------------------------+
+string ErrorDescription(int code)
+{
+   switch(code)
+   {
+      case 1: return "No error returned";
+      case 2: return "Common error";
+      case 3: return "Invalid trade parameters";
+      case 4: return "Trade server busy";
+      case 6: return "No connection";
+      case 8: return "Too frequent requests";
+      default: return "ErrCode:" + IntegerToString(code);
+   }
+}
+//+------------------------------------------------------------------+
